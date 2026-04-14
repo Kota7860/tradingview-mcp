@@ -159,6 +159,105 @@ export async function uiState() {
   return { success: true, ...state };
 }
 
+export async function launchWeb({ port, chart_url, headless } = {}) {
+  const cdpPort = port || parseInt(process.env.CDP_PORT || '9222', 10);
+  const url = chart_url || 'https://www.tradingview.com/chart/';
+  const isHeadless = headless !== false; // default true for server/VPS use
+
+  // Find Chrome/Chromium binary
+  const chromeCandidates = {
+    linux: [
+      '/usr/bin/google-chrome',
+      '/usr/bin/google-chrome-stable',
+      '/usr/bin/chromium-browser',
+      '/usr/bin/chromium',
+      '/snap/bin/chromium',
+      '/usr/bin/brave-browser',
+    ],
+    darwin: [
+      '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+      '/Applications/Chromium.app/Contents/MacOS/Chromium',
+      '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    ],
+    win32: [
+      `${process.env.PROGRAMFILES}\\Google\\Chrome\\Application\\chrome.exe`,
+      `${process.env['PROGRAMFILES(X86)']}\\Google\\Chrome\\Application\\chrome.exe`,
+      `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
+    ],
+  };
+
+  const platform = process.platform;
+  let chromePath = null;
+  for (const p of (chromeCandidates[platform] || chromeCandidates.linux)) {
+    if (p && existsSync(p)) { chromePath = p; break; }
+  }
+
+  if (!chromePath) {
+    try {
+      const cmd = platform === 'win32' ? 'where chrome.exe' : 'which google-chrome chromium-browser chromium 2>/dev/null | head -1';
+      chromePath = execSync(cmd, { timeout: 3000 }).toString().trim().split('\n')[0];
+      if (chromePath && !existsSync(chromePath)) chromePath = null;
+    } catch { /* ignore */ }
+  }
+
+  if (!chromePath) {
+    throw new Error(
+      'Chrome/Chromium not found. Install Google Chrome or Chromium, then retry.\n' +
+      'Ubuntu/Debian: apt install chromium-browser\n' +
+      'macOS: brew install --cask google-chrome'
+    );
+  }
+
+  const args = [
+    `--remote-debugging-port=${cdpPort}`,
+    '--remote-debugging-address=0.0.0.0',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-extensions',
+    '--disable-background-networking',
+    '--disable-sync',
+    '--metrics-recording-only',
+    '--disable-default-apps',
+    isHeadless ? '--headless=new' : '',
+    isHeadless ? '--disable-gpu' : '',
+    isHeadless ? '--no-sandbox' : '',
+    url,
+  ].filter(Boolean);
+
+  const child = spawn(chromePath, args, { detached: true, stdio: 'ignore' });
+  child.unref();
+
+  // Wait for CDP to become available
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const http = await import('http');
+      const ready = await new Promise((resolve) => {
+        http.get(`http://localhost:${cdpPort}/json/version`, (res) => {
+          let data = '';
+          res.on('data', (chunk) => data += chunk);
+          res.on('end', () => resolve(data));
+        }).on('error', () => resolve(null));
+      });
+      if (ready) {
+        const info = JSON.parse(ready);
+        return {
+          success: true, mode: 'web', platform, browser: chromePath, pid: child.pid,
+          headless: isHeadless, cdp_port: cdpPort,
+          url, browser_version: info.Browser,
+          note: 'TradingView web is loading. Wait ~10s then run tv_health_check.',
+        };
+      }
+    } catch { /* retry */ }
+  }
+
+  return {
+    success: true, mode: 'web', platform, browser: chromePath, pid: child.pid,
+    headless: isHeadless, cdp_port: cdpPort, cdp_ready: false,
+    warning: 'Chrome launched but CDP not ready yet. Try tv_health_check in a few seconds.',
+  };
+}
+
 export async function launch({ port, kill_existing } = {}) {
   const cdpPort = port || 9222;
   const killFirst = kill_existing !== false;

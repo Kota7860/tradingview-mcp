@@ -25,4 +25,13 @@ export function registerHealthTools(server) {
     try { return jsonResult(await core.launch({ port, kill_existing })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
+
+  server.tool('tv_launch_web', 'Launch Chrome/Chromium browser with TradingView web app and CDP enabled. Use this instead of tv_launch when running on a server or VPS without TradingView Desktop installed. Supports headless mode for cloud deployments.', {
+    port: z.coerce.number().optional().describe('CDP port (default 9222)'),
+    chart_url: z.string().optional().describe('TradingView chart URL (default https://www.tradingview.com/chart/)'),
+    headless: z.coerce.boolean().optional().describe('Run Chrome headless (default true — set false to see the browser window)'),
+  }, async ({ port, chart_url, headless }) => {
+    try { return jsonResult(await core.launchWeb({ port, chart_url, headless })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
 }
