@@ -24,9 +24,59 @@
  */
 
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import Anthropic from "@anthropic-ai/sdk";
+import * as core from "./core/index.js";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const VOICE_HTML = readFileSync(join(__dirname, "voice.html"), "utf8");
+
+// ── Voice tool definitions (subset of 78 tools suited for voice interaction) ──
+const VOICE_TOOLS = [
+  { name: "tv_health_check", description: "Check if TradingView is connected and return current chart state", input_schema: { type: "object", properties: {} } },
+  { name: "quote_get", description: "Get real-time price, OHLC, and volume for the current chart symbol", input_schema: { type: "object", properties: {} } },
+  { name: "chart_get_state", description: "Get current chart symbol, timeframe, chart type, and all indicator names", input_schema: { type: "object", properties: {} } },
+  { name: "chart_set_symbol", description: "Change the chart to a different symbol or ticker", input_schema: { type: "object", properties: { symbol: { type: "string", description: "e.g. BTCUSD, AAPL, ES1!, NYMEX:CL1!" } }, required: ["symbol"] } },
+  { name: "chart_set_timeframe", description: "Change the chart timeframe", input_schema: { type: "object", properties: { timeframe: { type: "string", description: "1, 3, 5, 15, 30, 60, 240, D, W, M" } }, required: ["timeframe"] } },
+  { name: "data_get_ohlcv", description: "Get price bar data. Always use summary=true for a quick overview", input_schema: { type: "object", properties: { count: { type: "number" }, summary: { type: "boolean" } } } },
+  { name: "data_get_study_values", description: "Get current values of all visible indicators like RSI, MACD, EMA, Bollinger Bands", input_schema: { type: "object", properties: {} } },
+  { name: "data_get_pine_lines", description: "Get horizontal price levels drawn by custom Pine Script indicators", input_schema: { type: "object", properties: { study_filter: { type: "string" } } } },
+  { name: "data_get_pine_labels", description: "Get text annotations with prices from custom Pine Script indicators", input_schema: { type: "object", properties: { study_filter: { type: "string" } } } },
+  { name: "data_get_pine_tables", description: "Get table data from custom Pine Script indicators", input_schema: { type: "object", properties: { study_filter: { type: "string" } } } },
+  { name: "capture_screenshot", description: "Take a screenshot of the chart", input_schema: { type: "object", properties: { region: { type: "string", description: "full, chart, or strategy_tester" } } } },
+  { name: "alert_create", description: "Create a price alert", input_schema: { type: "object", properties: { price: { type: "number" }, condition: { type: "string", description: "crossing, greater_than, less_than" }, message: { type: "string" } }, required: ["price", "condition"] } },
+  { name: "alert_list", description: "List all active price alerts", input_schema: { type: "object", properties: {} } },
+  { name: "draw_shape", description: "Draw a horizontal line, trend line, rectangle or text label on the chart", input_schema: { type: "object", properties: { shape: { type: "string", description: "horizontal_line, trend_line, rectangle, text" }, price: { type: "number" }, text: { type: "string" } }, required: ["shape"] } },
+  { name: "chart_manage_indicator", description: "Add or remove an indicator from the chart. Use full names like 'Relative Strength Index' not 'RSI'", input_schema: { type: "object", properties: { action: { type: "string", description: "add or remove" }, indicator_name: { type: "string" } }, required: ["action", "indicator_name"] } },
+];
+
+// Maps tool names to core function calls
+async function callTool(name, args) {
+  const a = args || {};
+  switch (name) {
+    case "tv_health_check":       return core.health.healthCheck();
+    case "quote_get":             return core.data.getQuote();
+    case "chart_get_state":       return core.chart.getState();
+    case "chart_set_symbol":      return core.chart.setSymbol(a);
+    case "chart_set_timeframe":   return core.chart.setTimeframe(a);
+    case "data_get_ohlcv":        return core.data.getOhlcv({ summary: true, ...a });
+    case "data_get_study_values": return core.data.getStudyValues();
+    case "data_get_pine_lines":   return core.data.getPineLines(a);
+    case "data_get_pine_labels":  return core.data.getPineLabels(a);
+    case "data_get_pine_tables":  return core.data.getPineTables(a);
+    case "capture_screenshot":    return core.capture.captureScreenshot(a);
+    case "alert_create":          return core.alerts.alertCreate(a);
+    case "alert_list":            return core.alerts.alertList();
+    case "draw_shape":            return core.drawing.drawShape(a);
+    case "chart_manage_indicator": return core.chart.manageIndicator(a);
+    default: throw new Error(`Unknown tool: ${name}`);
+  }
+}
 
 import { registerHealthTools } from "./tools/health.js";
 import { registerChartTools } from "./tools/chart.js";
@@ -211,10 +261,83 @@ const httpServer = createServer(async (req, res) => {
     return;
   }
 
+  // Voice chat UI
+  if (req.url === "/voice" || req.url === "/voice/") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(VOICE_HTML);
+    return;
+  }
+
+  // Voice chat API — calls Claude with MCP tools
+  if (req.url === "/api/chat" && req.method === "POST") {
+    const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+    if (!ANTHROPIC_API_KEY) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "ANTHROPIC_API_KEY env var not set. Add it when starting the server." }));
+      return;
+    }
+    try {
+      const body = await readBody(req);
+      const { message } = body || {};
+      if (!message) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "message required" }));
+        return;
+      }
+
+      const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+      const messages = [{ role: "user", content: message }];
+
+      let responseText = "Done.";
+      for (let turn = 0; turn < 10; turn++) {
+        const resp = await anthropic.messages.create({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1024,
+          system: "You are a TradingView voice assistant. Help the user analyze charts and manage their trading setup. Be brief and conversational — your responses will be spoken aloud. No markdown, no bullet points, plain sentences only.",
+          tools: VOICE_TOOLS,
+          messages,
+        });
+
+        if (resp.stop_reason === "end_turn") {
+          responseText = resp.content.find((b) => b.type === "text")?.text || "Done.";
+          break;
+        }
+
+        if (resp.stop_reason === "tool_use") {
+          messages.push({ role: "assistant", content: resp.content });
+          const results = [];
+          for (const block of resp.content) {
+            if (block.type !== "tool_use") continue;
+            let content;
+            try {
+              const result = await callTool(block.name, block.input);
+              content = JSON.stringify(result);
+            } catch (err) {
+              content = JSON.stringify({ error: err.message });
+            }
+            results.push({ type: "tool_result", tool_use_id: block.id, content });
+          }
+          messages.push({ role: "user", content: results });
+        } else {
+          break;
+        }
+      }
+
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ response: responseText }));
+    } catch (err) {
+      if (!res.headersSent) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    }
+    return;
+  }
+
   // Only /mcp is handled beyond this point
   if (!req.url?.startsWith("/mcp")) {
     res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found", mcp_endpoint: "/mcp" }));
+    res.end(JSON.stringify({ error: "Not found", mcp_endpoint: "/mcp", voice_endpoint: "/voice" }));
     return;
   }
 
@@ -269,6 +392,7 @@ process.stderr.write(
 httpServer.listen(PORT, "0.0.0.0", () => {
   process.stderr.write(`TradingView MCP HTTP server started\n`);
   process.stderr.write(`  MCP endpoint : http://0.0.0.0:${PORT}/mcp\n`);
+  process.stderr.write(`  Voice UI     : http://0.0.0.0:${PORT}/voice\n`);
   process.stderr.write(`  Health check : http://0.0.0.0:${PORT}/health\n`);
   if (API_KEY) {
     process.stderr.write(`  Auth         : enabled (x-api-key / Bearer)\n`);
@@ -276,6 +400,11 @@ httpServer.listen(PORT, "0.0.0.0", () => {
     process.stderr.write(
       `  Auth         : DISABLED — set MCP_API_KEY env var before exposing publicly\n`,
     );
+  }
+  if (!process.env.ANTHROPIC_API_KEY) {
+    process.stderr.write(`  Voice chat   : DISABLED — set ANTHROPIC_API_KEY to enable\n`);
+  } else {
+    process.stderr.write(`  Voice chat   : enabled\n`);
   }
   process.stderr.write("\n");
 });
