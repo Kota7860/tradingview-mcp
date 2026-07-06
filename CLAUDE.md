@@ -72,15 +72,17 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 ### "Trade on paper (demo) account"
 1. `trade_connect_paper` → connect TradingView's Paper Trading broker (must be logged in). Sets no-confirm so orders/closes execute programmatically.
 2. `trade_account` → account id, broker, currency
-3. `trade_place` → market/limit/stop order with optional TP/SL. **Refuses to run against a live broker** — paper only.
-4. `trade_positions` → open positions with side, qty, avg price, unrealized PnL (zero-qty residual rows filtered out)
-5. `trade_orders` → working orders (or `include_history: true` for history)
-6. `trade_close` → close one position by ID, or ALL if no ID
-7. `trade_cancel` → cancel a working order
+3. `trade_balance` → equity, available funds, balance, total unrealized PnL
+4. `trade_place` → market/limit/stop order with optional TP/SL. **Refuses to run against a live broker** — paper only.
+5. `trade_positions` → open positions with side, qty, avg price, unrealized PnL (zero-qty residual rows filtered out)
+6. `trade_orders` → working orders only by default (readable status/type); `all: true` for filled+canceled, `include_history: true` for history
+7. `trade_modify` → change limit/stop price, TP, SL, or qty on a working order (paper only)
+8. `trade_close` → close one position by ID, or ALL if no ID
+9. `trade_cancel` → cancel a working order
 
 Related non-MCP tooling in `scripts/`:
-- `rules_strategy.pine` → the rules.json bias (EMA20 + RSI) as a backtestable Pine strategy
-- `bot.js` → standalone loop that reads OHLCV, computes EMA/RSI, applies the rules, and places paper trades. Copy `bot.config.example.json` → `bot.config.json`. Defaults to `dry_run: true`; run with `--live` to actually place paper orders.
+- `rules_strategy.pine` → the rules.json bias (EMA20 + RSI) as a backtestable Pine strategy, with ATR-based stops/targets, risk-% position sizing, and optional trend + volume filters that mirror bot.js.
+- `bot.js` → standalone loop that reads OHLCV, computes EMA/RSI/ATR/trend/volume, applies the rules, and places paper trades with broker-managed SL/TP. Risk sizing from `risk_per_trade_pct`, halts on loss-streak and daily-loss limits, persists state across restarts (`bot.state.json`) and logs to `bot.log`. Copy `bot.config.example.json` → `bot.config.json`. Defaults to `dry_run: true`; run with `--live` to place paper orders.
 
 ### "Manage alerts"
 - `alert_create` → set price alert (condition: "crossing", "greater_than", "less_than")

@@ -25,7 +25,7 @@ const server = new McpServer(
       "AI-assisted TradingView chart analysis and Pine Script development via Chrome DevTools Protocol",
   },
   {
-    instructions: `TradingView MCP — 86 tools for reading and controlling a live TradingView Desktop chart.
+    instructions: `TradingView MCP — 88 tools for reading and controlling a live TradingView Desktop chart.
 
 TOOL SELECTION GUIDE — use this to pick the right tool:
 
@@ -60,7 +60,7 @@ Replay: replay_start → replay_step → replay_trade → replay_status → repl
 Batch: batch_run → run action across multiple symbols/timeframes
 Drawing: draw_shape → horizontal_line, trend_line, rectangle, text
 Alerts: alert_create, alert_list, alert_delete
-Paper trading: trade_connect_paper → trade_place (market/limit/stop, TP/SL) → trade_positions → trade_close. Paper account only — trade_place refuses live brokers.
+Paper trading: trade_connect_paper → trade_place (market/limit/stop, TP/SL) → trade_positions / trade_balance → trade_modify / trade_close. trade_orders shows working orders only by default (all=true for everything). Paper account only — trade_place/trade_modify refuse live brokers.
 Launch: tv_launch → auto-detect and start TradingView with CDP on any platform
 Panes: pane_list, pane_set_layout (s, 2h, 2v, 4, 6, 8), pane_focus, pane_set_symbol
 Tabs: tab_list, tab_new, tab_close, tab_switch

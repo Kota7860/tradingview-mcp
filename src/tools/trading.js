@@ -18,10 +18,28 @@ export function registerTradingTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
-  server.tool('trade_orders', 'List working orders (or order history with include_history=true)', {
-    include_history: z.coerce.boolean().optional().describe('Return order history instead of working orders'),
-  }, async ({ include_history }) => {
-    try { return jsonResult(await core.getOrders({ include_history })); }
+  server.tool('trade_orders', 'List working orders only (default). Use all=true for every order incl. filled/canceled, or include_history=true for order history. Status and type are human-readable.', {
+    all: z.coerce.boolean().optional().describe('Return all orders (working + filled + canceled), not just working'),
+    include_history: z.coerce.boolean().optional().describe('Return order history instead of the live order list'),
+  }, async ({ all, include_history }) => {
+    try { return jsonResult(await core.getOrders({ all, include_history })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('trade_balance', 'Get account balance, equity, available funds, and total unrealized PnL', {}, async () => {
+    try { return jsonResult(await core.getBalance()); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
+  server.tool('trade_modify', 'Modify a working order: change limit/stop price, take-profit, stop-loss, or quantity. Paper account only.', {
+    order_id: z.string().describe('Order ID from trade_orders'),
+    limit_price: z.coerce.number().optional().describe('New limit price'),
+    stop_price: z.coerce.number().optional().describe('New stop price'),
+    take_profit: z.coerce.number().optional().describe('New take-profit price'),
+    stop_loss: z.coerce.number().optional().describe('New stop-loss price'),
+    qty: z.coerce.number().optional().describe('New quantity'),
+  }, async (args) => {
+    try { return jsonResult(await core.modifyOrder(args)); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

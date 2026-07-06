@@ -120,7 +120,12 @@ export async function getPositions() {
   return { success: true, position_count: positions.length, positions };
 }
 
-export async function getOrders({ include_history } = {}) {
+// TradingView Broker OrderStatus enum
+const ORDER_STATUS = { 1: 'canceled', 2: 'filled', 3: 'inactive', 4: 'placing', 5: 'rejected', 6: 'working' };
+const ORDER_TYPE_NAME = { 1: 'limit', 2: 'market', 3: 'stop', 4: 'stop_limit' };
+const WORKING_STATUSES = new Set([4, 6]); // placing, working
+
+export async function getOrders({ include_history, all } = {}) {
   const status = await getStatus();
   if (!status.broker_connected) throw new Error('No broker connected. Use trade_connect_paper first.');
   const orders = await evaluateAsync(`
@@ -128,13 +133,82 @@ export async function getOrders({ include_history } = {}) {
       var ab = ${BROKER};
       var fetch = ${include_history ? 'ab.ordersHistory()' : 'ab.orders()'};
       return Promise.resolve(fetch).then(function(list) {
-        return (list || []).slice(0, 50).map(function(o) {
-          return { id: o.id, symbol: o.symbol, side: o.side === 1 ? 'buy' : 'sell', qty: o.qty, type: o.type, status: o.status, limit_price: o.limitPrice, stop_price: o.stopPrice, avg_price: o.avgPrice, placing_time: o.placingTime };
+        return (list || []).slice(0, 100).map(function(o) {
+          return { id: o.id, symbol: o.symbol, side: o.side === 1 ? 'buy' : 'sell', qty: o.qty, type: o.type, status: o.status, limit_price: o.limitPrice, stop_price: o.stopPrice, avg_price: o.avgPrice, take_profit: o.takeProfit, stop_loss: o.stopLoss, placing_time: o.placingTime };
         });
       });
     })()
   `);
-  return { success: true, order_count: orders.length, orders };
+  // Default: only live/working orders. include_history or all=true returns everything.
+  const shown = (include_history || all) ? orders : orders.filter(o => WORKING_STATUSES.has(o.status));
+  const decorated = shown.map(o => ({
+    ...o,
+    type: ORDER_TYPE_NAME[o.type] || o.type,
+    status: ORDER_STATUS[o.status] || o.status,
+  }));
+  return { success: true, order_count: decorated.length, filter: (include_history || all) ? 'all' : 'working_only', orders: decorated };
+}
+
+export async function getBalance() {
+  const status = await getStatus();
+  if (!status.broker_connected) throw new Error('No broker connected. Use trade_connect_paper first.');
+  // Live equity + available margin come via subscription callbacks: cb(metricName, value, extra)
+  const funds = await evaluateAsync(`
+    (function() {
+      var ab = ${BROKER};
+      return new Promise(function(resolve) {
+        var out = {};
+        var done = setTimeout(function() { resolve(out); }, 4000);
+        try { ab.subscribeEquity(function(_id, v) { out.equity = v; if (out.available_funds != null) { clearTimeout(done); resolve(out); } }); } catch(e) { out.equity_error = e.message; }
+        try { ab.subscribeMarginAvailable(function(_id, v) { out.available_funds = v; if (out.equity != null) { clearTimeout(done); resolve(out); } }); } catch(e) { out.margin_error = e.message; }
+      });
+    })()
+  `);
+  // Unrealized PnL from open positions; balance = equity - unrealized
+  const { positions } = await getPositions();
+  const unrealized = positions.reduce((sum, p) => sum + (p.unrealized_pnl || 0), 0);
+  const equity = funds.equity;
+  const round = (n) => n == null ? null : Math.round(n * 100) / 100;
+  return {
+    success: true,
+    equity: round(equity),
+    available_funds: round(funds.available_funds),
+    unrealized_pnl: round(unrealized),
+    balance: round(equity != null ? equity - unrealized : null),
+    open_positions: positions.length,
+    currency: 'USD',
+  };
+}
+
+export async function modifyOrder({ order_id, limit_price, stop_price, take_profit, stop_loss, qty }) {
+  const status = await getStatus();
+  if (!status.broker_connected) throw new Error('No broker connected. Use trade_connect_paper first.');
+  if (!order_id) throw new Error('order_id is required');
+  if (status.broker_id && !/paper/i.test(String(status.broker_id))) {
+    throw new Error(`Refusing to modify order: active broker is "${status.broker_id}", not Paper Trading.`);
+  }
+  const changes = {};
+  if (limit_price != null) changes.limitPrice = Number(limit_price);
+  if (stop_price != null) changes.stopPrice = Number(stop_price);
+  if (take_profit != null) changes.takeProfit = Number(take_profit);
+  if (stop_loss != null) changes.stopLoss = Number(stop_loss);
+  if (qty != null) changes.qty = Number(qty);
+  if (Object.keys(changes).length === 0) throw new Error('Provide at least one field to modify (limit_price, stop_price, take_profit, stop_loss, qty)');
+
+  // modifyOrder requires the FULL order object with changes merged in, not just the deltas.
+  const result = await evaluateAsync(`
+    (function() {
+      var ab = ${BROKER};
+      return Promise.resolve(ab.orders()).then(function(list) {
+        var order = (list || []).filter(function(o) { return String(o.id) === ${safeString(String(order_id))}; })[0];
+        if (!order) return { error: 'Order not found or no longer working: ' + ${safeString(String(order_id))} };
+        var merged = Object.assign({}, order, ${JSON.stringify(changes)});
+        return Promise.resolve(ab.modifyOrder(merged)).then(function(ok) { return { ok: !!ok }; });
+      });
+    })()
+  `);
+  if (result && result.error) throw new Error(result.error);
+  return { success: true, modified: order_id, applied: result?.ok !== false, changes };
 }
 
 export async function placeOrder({ symbol, side, qty, type, limit_price, stop_price, take_profit, stop_loss }) {

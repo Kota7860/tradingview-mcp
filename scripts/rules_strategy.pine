@@ -1,55 +1,86 @@
 //@version=5
-// Rules Strategy — a backtestable encoding of rules.json bias criteria.
-// Long bias : price above 20 EMA AND RSI < 60 (room to run)
-// Short bias: price below 20 EMA AND RSI > 40 (room to drop)
-// Exit on bias flip or stop/target. R:R enforced via risk_reward input.
+// Rules Strategy v2 — rules.json bias (EMA20 + RSI) with risk management and
+// signal filters that mirror scripts/bot.js, so the backtest matches what the
+// bot trades live.
 //
-// This mirrors the morning_brief logic so you can backtest the same rules the
-// bot/Claude trade live. Tune inputs to match your rules.json, then run the
-// Strategy Tester.
-strategy("Rules Strategy (EMA20 + RSI)", overlay=true, initial_capital=10000,
+// Entry bias:
+//   Long : price > EMA, RSI < rsiLongMax, (optional) price > trend EMA, volume > its MA
+//   Short: price < EMA, RSI > rsiShortMin, (optional) price < trend EMA, volume > its MA
+// Exits: ATR-based stop and R:R target, plus a bias-flip close.
+// Sizing: risk a fixed % of equity per trade (stop distance = atrStopMult * ATR).
+strategy("Rules Strategy v2 (EMA/RSI + ATR risk)", overlay=true, initial_capital=10000,
      default_qty_type=strategy.percent_of_equity, default_qty_value=10,
      commission_type=strategy.commission.percent, commission_value=0.02,
-     pyramiding=0)
+     pyramiding=0, calc_on_order_fills=false)
 
-// ---- Inputs (map these to rules.json) ----
-emaLen      = input.int(20,  "EMA length")
-rsiLen      = input.int(14,  "RSI length")
-rsiLongMax  = input.int(60,  "Long: RSI must be below")
-rsiShortMin = input.int(40,  "Short: RSI must be above")
-riskReward  = input.float(2.0, "Reward:Risk (rules: min 1:2)", minval=0.5, step=0.5)
-stopPct     = input.float(1.0, "Stop distance (% of price)", minval=0.1, step=0.1)
-allowLong   = input.bool(true, "Allow longs")
-allowShort  = input.bool(true, "Allow shorts")
-backtestBars = input.int(1500, "Backtest last N bars (keeps orders under engine cap)", minval=100)
+// ---- Inputs (map these to rules.json / bot.config.json) ----
+emaLen       = input.int(20,  "EMA length", group="Bias")
+rsiLen       = input.int(14,  "RSI length", group="Bias")
+rsiLongMax   = input.int(60,  "Long: RSI below", group="Bias")
+rsiShortMin  = input.int(40,  "Short: RSI above", group="Bias")
+
+useTrend     = input.bool(true, "Use trend filter", group="Filters")
+trendLen     = input.int(50,  "Trend EMA length", group="Filters")
+useVol       = input.bool(true, "Use volume filter", group="Filters")
+volMaLen     = input.int(20,  "Volume MA length", group="Filters")
+
+atrLen       = input.int(14,  "ATR length", group="Risk")
+atrStopMult  = input.float(1.5, "ATR stop multiple", step=0.1, group="Risk")
+riskReward   = input.float(2.0, "Reward:Risk", minval=0.5, step=0.5, group="Risk")
+riskPct      = input.float(0.5, "Risk % of equity per trade", minval=0.0, step=0.1, group="Risk")
+
+allowLong    = input.bool(true, "Allow longs", group="Direction")
+allowShort   = input.bool(true, "Allow shorts", group="Direction")
+backtestBars = input.int(2000, "Backtest last N bars", minval=100, group="Direction")
 
 inWindow = bar_index > last_bar_index - backtestBars
 
 // ---- Indicators ----
-ema = ta.ema(close, emaLen)
-rsi = ta.rsi(close, rsiLen)
+ema      = ta.ema(close, emaLen)
+rsi      = ta.rsi(close, rsiLen)
+trendEma = ta.ema(close, trendLen)
+atr      = ta.atr(atrLen)
+volMa    = ta.sma(volume, volMaLen)
 
-// ---- Bias (rules.json criteria) ----
-bullBias = close > ema and rsi < rsiLongMax
-bearBias = close < ema and rsi > rsiShortMin
+trendUp  = not useTrend or close > trendEma
+trendDn  = not useTrend or close < trendEma
+volOk    = not useVol   or volume > volMa
 
-plot(ema, "EMA20", color=color.orange, linewidth=2)
+// ---- Bias ----
+bullBias = close > ema and rsi < rsiLongMax and trendUp and volOk
+bearBias = close < ema and rsi > rsiShortMin and trendDn and volOk
 
-// ---- Entries (edge-triggered: only on the bar the bias turns on) ----
+plot(ema,      "EMA",   color=color.orange, linewidth=2)
+plot(useTrend ? trendEma : na, "Trend EMA", color=color.blue, linewidth=1)
+
+// ---- Position sizing: risk riskPct of equity over the stop distance ----
+stopDist = atr * atrStopMult
+riskAmt  = strategy.equity * (riskPct / 100.0)
+qtyByRisk = (riskPct > 0 and stopDist > 0) ? riskAmt / stopDist : na
+
+// ---- Entries (edge-triggered) ----
 longSig  = allowLong  and bullBias and not bullBias[1] and inWindow
 shortSig = allowShort and bearBias and not bearBias[1] and inWindow
 
 if longSig and strategy.position_size <= 0
-    stopDist = close * stopPct / 100.0
-    strategy.entry("Long", strategy.long)
-    strategy.exit("Long TP/SL", from_entry="Long", stop=close - stopDist, limit=close + stopDist * riskReward)
+    stop   = close - stopDist
+    target = close + stopDist * riskReward
+    if na(qtyByRisk)
+        strategy.entry("Long", strategy.long)
+    else
+        strategy.entry("Long", strategy.long, qty=qtyByRisk)
+    strategy.exit("Long X", from_entry="Long", stop=stop, limit=target)
 
 if shortSig and strategy.position_size >= 0
-    stopDist = close * stopPct / 100.0
-    strategy.entry("Short", strategy.short)
-    strategy.exit("Short TP/SL", from_entry="Short", stop=close + stopDist, limit=close - stopDist * riskReward)
+    stop   = close + stopDist
+    target = close - stopDist * riskReward
+    if na(qtyByRisk)
+        strategy.entry("Short", strategy.short)
+    else
+        strategy.entry("Short", strategy.short, qty=qtyByRisk)
+    strategy.exit("Short X", from_entry="Short", stop=stop, limit=target)
 
-// ---- Exit on bias flip (belt-and-suspenders) ----
+// ---- Bias-flip close ----
 if strategy.position_size > 0 and bearBias
     strategy.close("Long", comment="bias flip")
 if strategy.position_size < 0 and bullBias

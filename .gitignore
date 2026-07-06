@@ -5,4 +5,6 @@ temp_*
 *.log
 discovery-log.json
 scripts/bot.config.json
+scripts/bot.state.json
+scripts/bot.log
 rules.json
