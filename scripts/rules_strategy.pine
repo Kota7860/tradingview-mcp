@@ -1,0 +1,61 @@
+//@version=5
+// Rules Strategy — a backtestable encoding of rules.json bias criteria.
+// Long bias : price above 20 EMA AND RSI < 60 (room to run)
+// Short bias: price below 20 EMA AND RSI > 40 (room to drop)
+// Exit on bias flip or stop/target. R:R enforced via risk_reward input.
+//
+// This mirrors the morning_brief logic so you can backtest the same rules the
+// bot/Claude trade live. Tune inputs to match your rules.json, then run the
+// Strategy Tester.
+strategy("Rules Strategy (EMA20 + RSI)", overlay=true, initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+     commission_type=strategy.commission.percent, commission_value=0.02,
+     pyramiding=0)
+
+// ---- Inputs (map these to rules.json) ----
+emaLen      = input.int(20,  "EMA length")
+rsiLen      = input.int(14,  "RSI length")
+rsiLongMax  = input.int(60,  "Long: RSI must be below")
+rsiShortMin = input.int(40,  "Short: RSI must be above")
+riskReward  = input.float(2.0, "Reward:Risk (rules: min 1:2)", minval=0.5, step=0.5)
+stopPct     = input.float(1.0, "Stop distance (% of price)", minval=0.1, step=0.1)
+allowLong   = input.bool(true, "Allow longs")
+allowShort  = input.bool(true, "Allow shorts")
+backtestBars = input.int(1500, "Backtest last N bars (keeps orders under engine cap)", minval=100)
+
+inWindow = bar_index > last_bar_index - backtestBars
+
+// ---- Indicators ----
+ema = ta.ema(close, emaLen)
+rsi = ta.rsi(close, rsiLen)
+
+// ---- Bias (rules.json criteria) ----
+bullBias = close > ema and rsi < rsiLongMax
+bearBias = close < ema and rsi > rsiShortMin
+
+plot(ema, "EMA20", color=color.orange, linewidth=2)
+
+// ---- Entries (edge-triggered: only on the bar the bias turns on) ----
+longSig  = allowLong  and bullBias and not bullBias[1] and inWindow
+shortSig = allowShort and bearBias and not bearBias[1] and inWindow
+
+if longSig and strategy.position_size <= 0
+    stopDist = close * stopPct / 100.0
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long TP/SL", from_entry="Long", stop=close - stopDist, limit=close + stopDist * riskReward)
+
+if shortSig and strategy.position_size >= 0
+    stopDist = close * stopPct / 100.0
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short TP/SL", from_entry="Short", stop=close + stopDist, limit=close - stopDist * riskReward)
+
+// ---- Exit on bias flip (belt-and-suspenders) ----
+if strategy.position_size > 0 and bearBias
+    strategy.close("Long", comment="bias flip")
+if strategy.position_size < 0 and bullBias
+    strategy.close("Short", comment="bias flip")
+
+// ---- Visuals ----
+bgcolor(bullBias ? color.new(color.green, 92) : bearBias ? color.new(color.red, 92) : na)
+plotshape(longSig  and strategy.position_size <= 0, "Long",  shape.triangleup,   location.belowbar, color.green, size=size.small)
+plotshape(shortSig and strategy.position_size >= 0, "Short", shape.triangledown, location.abovebar, color.red,   size=size.small)

@@ -23,6 +23,7 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `data_get_ohlcv` with `summary: true` → compact stats (high, low, range, change%, avg volume, last 5 bars)
 - `data_get_ohlcv` without summary → all bars (use `count` to limit, default 100)
 - `quote_get` → single latest price snapshot
+- `quote_multi` → snapshots for up to 20 symbols in one call (restores original chart symbol after)
 
 ### "Analyze my chart" (full report workflow)
 1. `quote_get` → current price
@@ -67,6 +68,19 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `draw_list` → see what's drawn
 - `draw_remove_one` → remove by ID
 - `draw_clear` → remove all
+
+### "Trade on paper (demo) account"
+1. `trade_connect_paper` → connect TradingView's Paper Trading broker (must be logged in). Sets no-confirm so orders/closes execute programmatically.
+2. `trade_account` → account id, broker, currency
+3. `trade_place` → market/limit/stop order with optional TP/SL. **Refuses to run against a live broker** — paper only.
+4. `trade_positions` → open positions with side, qty, avg price, unrealized PnL (zero-qty residual rows filtered out)
+5. `trade_orders` → working orders (or `include_history: true` for history)
+6. `trade_close` → close one position by ID, or ALL if no ID
+7. `trade_cancel` → cancel a working order
+
+Related non-MCP tooling in `scripts/`:
+- `rules_strategy.pine` → the rules.json bias (EMA20 + RSI) as a backtestable Pine strategy
+- `bot.js` → standalone loop that reads OHLCV, computes EMA/RSI, applies the rules, and places paper trades. Copy `bot.config.example.json` → `bot.config.json`. Defaults to `dry_run: true`; run with `--live` to actually place paper orders.
 
 ### "Manage alerts"
 - `alert_create` → set price alert (condition: "crossing", "greater_than", "less_than")

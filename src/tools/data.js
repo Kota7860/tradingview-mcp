@@ -42,6 +42,14 @@ export function registerDataTools(server) {
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 
+  server.tool('quote_multi', 'Get real-time quotes for multiple symbols in one call. Switches the chart through each symbol, reads the quote, then restores the original symbol.', {
+    symbols: z.array(z.string()).min(1).max(20).describe('Symbols to quote (e.g., ["BTCUSD", "ETHUSD", "SOLUSD"]), max 20'),
+    delay_ms: z.coerce.number().optional().describe('Extra settle time per symbol after chart load, in ms (default 1500)'),
+  }, async ({ symbols, delay_ms }) => {
+    try { return jsonResult(await core.getQuoteMulti({ symbols, delay_ms })); }
+    catch (err) { return jsonResult({ success: false, error: err.message }, true); }
+  });
+
   server.tool('depth_get', 'Get order book / DOM (Depth of Market) data from the chart', {}, async () => {
     try { return jsonResult(await core.getDepth()); }
     catch (err) { return jsonResult({ success: false, error: err.message, hint: 'Open the DOM panel in TradingView before using this tool.' }, true); }
