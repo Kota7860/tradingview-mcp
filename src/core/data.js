@@ -2,6 +2,7 @@
  * Core data access logic.
  */
 import { evaluate, evaluateAsync, KNOWN_PATHS, safeString } from '../connection.js';
+import { waitForChartReady } from '../wait.js';
 
 const MAX_OHLCV_BARS = 500;
 const MAX_TRADES = 20;
@@ -242,8 +243,8 @@ export async function getEquity() {
   return { success: true, data_points: equity?.data?.length || 0, source: equity?.source, data: equity?.data || [], equity_summary: equity?.equity_summary, note: equity?.note, error: equity?.error };
 }
 
-export async function getQuote({ symbol } = {}) {
-  const data = await evaluate(`
+function quoteExpression(symbol) {
+  return `
     (function() {
       var api = ${CHART_API};
       var sym = ${safeString(symbol || '')};
@@ -272,9 +273,47 @@ export async function getQuote({ symbol } = {}) {
       if (ext.type) quote.type = ext.type;
       return quote;
     })()
-  `);
+  `;
+}
+
+export async function getQuote({ symbol } = {}) {
+  const data = await evaluate(quoteExpression(symbol));
   if (!data || (!data.last && !data.close)) throw new Error('Could not retrieve quote. The chart may still be loading.');
   return { success: true, ...data };
+}
+
+export async function getQuoteMulti({ symbols, delay_ms } = {}) {
+  if (!Array.isArray(symbols) || symbols.length === 0) throw new Error('symbols must be a non-empty array');
+  if (symbols.length > 20) throw new Error('Maximum 20 symbols per request');
+  const delay = delay_ms || 1500;
+
+  let original = null;
+  try { original = await evaluate(`${CHART_API}.symbol()`); } catch {}
+
+  const setSymbol = async (sym) => {
+    await evaluate(`${CHART_API}.setSymbol(${safeString(sym)})`);
+  };
+
+  const quotes = [];
+  for (const sym of symbols) {
+    try {
+      await setSymbol(sym);
+      await waitForChartReady(sym);
+      await new Promise(r => setTimeout(r, delay));
+      const data = await evaluate(quoteExpression(''));
+      if (!data || (!data.last && !data.close)) throw new Error('quote unavailable (chart may still be loading)');
+      quotes.push({ requested_symbol: sym, ...data, success: true });
+    } catch (err) {
+      quotes.push({ requested_symbol: sym, success: false, error: err.message });
+    }
+  }
+
+  if (original) {
+    try { await setSymbol(original); await waitForChartReady(original); } catch {}
+  }
+
+  const retrieved = quotes.filter(q => q.success).length;
+  return { success: true, requested: symbols.length, retrieved, failed: symbols.length - retrieved, restored_symbol: original, quotes };
 }
 
 export async function getDepth() {

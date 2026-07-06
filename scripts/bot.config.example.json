@@ -1,0 +1,14 @@
+{
+  "symbols": ["BITSTAMP:BTCUSD", "COINBASE:ETHUSD"],
+  "timeframe": "240",
+  "poll_seconds": 60,
+  "qty_per_trade": 0.001,
+  "ema_length": 20,
+  "rsi_length": 14,
+  "rsi_long_max": 60,
+  "rsi_short_min": 40,
+  "max_open_positions": 2,
+  "stop_after_consecutive_losses": 2,
+  "dry_run": true,
+  "allow_short": true
+}
