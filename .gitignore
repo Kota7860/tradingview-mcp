@@ -5,4 +5,11 @@ temp_*
 *.log
 discovery-log.json
 scripts/bot.config.json
+scripts/bot.state.json
+scripts/bot.log
 rules.json
+
+# FPU indicator source is a protected/published script — keep it out of the public repo by default
+scripts/fpu_v4_original.pine
+scripts/fpu_v5.pine
+scripts/bot.trades.csv
