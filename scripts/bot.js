@@ -34,6 +34,8 @@
 import { readFileSync, existsSync, writeFileSync, appendFileSync } from 'fs';
 import { join, dirname, isAbsolute } from 'path';
 import { fileURLToPath } from 'url';
+import { createServer } from 'http';
+import { request as httpsRequest } from 'https';
 import * as data from '../src/core/data.js';
 import * as chart from '../src/core/chart.js';
 import * as trading from '../src/core/trading.js';
@@ -60,6 +62,7 @@ if (liveFlag) cfg.dry_run = false;
 
 const stateFile = resolvePath(cfg.state_file || 'scripts/bot.state.json');
 const logFile = resolvePath(cfg.log_file || 'scripts/bot.log');
+const journalFile = resolvePath(cfg.journal_file || 'scripts/bot.trades.csv');
 
 function log(...parts) {
   const line = `${new Date().toISOString()} ${parts.join(' ')}`;
@@ -74,7 +77,13 @@ const defaultState = () => ({
   dayStartEquity: null,
   halted: false,
   haltReason: null,
-  dryBook: {}, // symbol -> { side, qty, entry, stop, target } (dry-run simulated positions)
+  // symbol -> { side, qty, entry, stop, target, source, openTime, initStopDist, slAtBE }
+  // Metadata for bot-managed positions in BOTH live and dry-run modes.
+  openTrades: {},
+  stats: { trades: 0, wins: 0, losses: 0, pnl: 0, sumR: 0 },
+  tradesToday: 0,
+  tradesDayKey: null,
+  lastExit: {}, // symbol -> epoch ms of last close (for cooldown)
 });
 let state = defaultState();
 function loadState() {
@@ -85,6 +94,83 @@ function loadState() {
 }
 function saveState() {
   try { writeFileSync(stateFile, JSON.stringify(state, null, 2)); } catch (e) { log('WARN saveState:', e.message); }
+}
+
+// ---- Notifications (Telegram / Discord), fire-and-forget ----
+function postJson(url, payload) {
+  return new Promise((resolve) => {
+    try {
+      const u = new URL(url);
+      const body = JSON.stringify(payload);
+      const req = httpsRequest({ hostname: u.hostname, path: u.pathname + u.search, method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (res) => { res.on('data', () => {}); res.on('end', resolve); });
+      req.on('error', (e) => { log('WARN notify:', e.message); resolve(); });
+      req.write(body); req.end();
+    } catch (e) { log('WARN notify:', e.message); resolve(); }
+  });
+}
+function notify(text) {
+  const n = cfg.notify || {};
+  if (n.telegram && n.telegram.enabled && n.telegram.bot_token && n.telegram.chat_id) {
+    postJson(`https://api.telegram.org/bot${n.telegram.bot_token}/sendMessage`, { chat_id: n.telegram.chat_id, text });
+  }
+  if (n.discord && n.discord.enabled && n.discord.webhook_url) {
+    postJson(n.discord.webhook_url, { content: text });
+  }
+}
+
+// ---- Trade journal ----
+function journalTrade(row) {
+  const header = 'close_time,symbol,side,qty,entry,exit,stop,pnl,R,source,reason\n';
+  if (!existsSync(journalFile)) { try { writeFileSync(journalFile, header); } catch {} }
+  const line = [new Date().toISOString(), row.symbol, row.side, row.qty, fmt(row.entry), fmt(row.exit), fmt(row.stop), fmt(row.pnl, 4), fmt(row.R, 2), row.source, row.reason].join(',') + '\n';
+  try { appendFileSync(journalFile, line); } catch (e) { log('WARN journal:', e.message); }
+}
+function recordStats(pnl, R) {
+  const s = state.stats;
+  s.trades++; s.pnl += pnl; s.sumR += (R || 0);
+  if (pnl >= 0) s.wins++; else s.losses++;
+}
+function statsSummary() {
+  const s = state.stats || { trades: 0, wins: 0, losses: 0, pnl: 0, sumR: 0 };
+  const wr = s.trades ? (s.wins / s.trades * 100) : 0;
+  const avgR = s.trades ? (s.sumR / s.trades) : 0;
+  return `trades=${s.trades} win%=${wr.toFixed(0)} pnl=${fmt(s.pnl)} avgR=${avgR.toFixed(2)}`;
+}
+
+// ---- Discipline guards ----
+function minutesNowInTz(tz) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour12: false, hour: '2-digit', minute: '2-digit' }).formatToParts(new Date());
+    const h = +parts.find(p => p.type === 'hour').value;
+    const m = +parts.find(p => p.type === 'minute').value;
+    return (h % 24) * 60 + m;
+  } catch { return null; }
+}
+function parseHM(s) { const [h, m] = String(s || '0:0').split(':').map(Number); return h * 60 + (m || 0); }
+function sessionOk() {
+  const sf = cfg.session_filter;
+  if (!sf || !sf.enabled) return true;
+  const now = minutesNowInTz(sf.timezone || 'UTC');
+  if (now == null) return true;
+  const start = parseHM(sf.start || '00:00');
+  const end = parseHM(sf.end || '23:59');
+  const inWin = start <= end ? (now >= start && now <= end) : (now >= start || now <= end);
+  if (!inWin) return false;
+  if (sf.skip_open_minutes && now >= start && now < start + sf.skip_open_minutes) return false;
+  return true;
+}
+function rollTradesDay() {
+  const today = new Date().toISOString().substring(0, 10);
+  if (state.tradesDayKey !== today) { state.tradesDayKey = today; state.tradesToday = 0; }
+}
+// Returns { ok, reason } — checks that a NEW entry is allowed right now.
+function entryGuards(symbol) {
+  if (!sessionOk()) return { ok: false, reason: 'outside_session' };
+  rollTradesDay();
+  if (cfg.max_trades_per_day > 0 && state.tradesToday >= cfg.max_trades_per_day) return { ok: false, reason: 'max_trades_day' };
+  const last = (state.lastExit || {})[symbol];
+  if (cfg.cooldown_seconds > 0 && last && (Date.now() - last) < cfg.cooldown_seconds * 1000) return { ok: false, reason: 'cooldown' };
+  return { ok: true };
 }
 
 // ---- Indicator math ----
@@ -195,49 +281,193 @@ async function currentEquity() {
   try { const b = await trading.getBalance(); return b.equity; } catch { return null; }
 }
 
-async function evaluateSymbol(symbol, openBySymbol, equity) {
-  await chart.setSymbol({ symbol });
-  await new Promise(r => setTimeout(r, 1500));
-  const ohlcv = await data.getOhlcv({ count: 250 });
-  const a = analyze(ohlcv.bars);
-  const existing = openBySymbol[symbol]; // 'long' | 'short' | undefined
-  log(`${symbol} px=${a.price} ema=${fmt(a.ema)} rsi=${fmt(a.rsi, 1)} atr=${fmt(a.atr)} trend=${a.trendUp ? 'up' : a.trendDown ? 'down' : 'flat'} vol=${a.volOk ? 'ok' : 'low'} bias=${a.bias} pos=${existing || 'flat'}`);
+// Close an open position for a symbol: compute PnL, journal it, update stats,
+// loss streak, cooldown, and notify.
+async function closeSymbol(symbol, openBySymbol, reason = 'signal') {
+  const meta = state.openTrades[symbol] || null;
+  let pnl = null, exitPrice = null;
 
-  // Exit if bias flipped against an open position
-  if (existing && existing !== a.bias && a.bias !== 'neutral') {
-    log(`  -> close ${existing} ${symbol} (bias flip -> ${a.bias})`);
-    if (!cfg.dry_run) {
-      const pos = (await trading.getPositions()).positions.find(p => p.symbol === symbol);
-      if (pos) {
-        if ((pos.unrealized_pnl || 0) < 0) state.consecutiveLosses++; else state.consecutiveLosses = 0;
-        await trading.closePosition({ position_id: pos.id });
-      }
-    } else {
-      delete state.dryBook[symbol];
+  if (!cfg.dry_run) {
+    const pos = (await trading.getPositions()).positions.find(p => p.symbol === symbol);
+    if (pos) {
+      pnl = pos.unrealized_pnl || 0;
+      exitPrice = pos.last_price;
+      await trading.closePosition({ position_id: pos.id });
     }
-    delete openBySymbol[symbol];
-    saveState();
+  } else if (meta) {
+    // Mark-to-market with a fresh quote for the exit price.
+    try { const q = await data.getQuote({ symbol }); exitPrice = q.last ?? q.close; } catch {}
+    if (exitPrice != null) pnl = (meta.side === 'long' ? exitPrice - meta.entry : meta.entry - exitPrice) * meta.qty;
+    delete state.dryBook?.[symbol];
   }
 
-  // Open a new position matching bias
-  if (!openBySymbol[symbol] && (a.bias === 'long' || a.bias === 'short')) {
-    if (Object.keys(openBySymbol).length >= cfg.max_open_positions) {
-      log(`  -> skip ${a.bias} ${symbol} (max ${cfg.max_open_positions} positions)`);
-      return;
+  if (meta && pnl != null) {
+    const risk = (meta.initStopDist || Math.abs(meta.entry - meta.stop)) * meta.qty;
+    const R = risk > 0 ? pnl / risk : 0;
+    journalTrade({ symbol, side: meta.side, qty: meta.qty, entry: meta.entry, exit: exitPrice, stop: meta.stop, pnl, R, source: meta.source, reason });
+    recordStats(pnl, R);
+    state.consecutiveLosses = pnl < 0 ? state.consecutiveLosses + 1 : 0;
+    log(`  = CLOSE ${meta.side} ${symbol} exit~${fmt(exitPrice)} pnl=${fmt(pnl, 4)} R=${R.toFixed(2)} (${reason}) | ${statsSummary()}`);
+    notify(`CLOSE ${meta.side} ${symbol} @ ${fmt(exitPrice)} | pnl ${fmt(pnl, 2)} (R ${R.toFixed(2)}) | ${reason}`);
+  }
+
+  delete state.openTrades[symbol];
+  delete openBySymbol[symbol];
+  state.lastExit = state.lastExit || {};
+  state.lastExit[symbol] = Date.now();
+  saveState();
+}
+
+// Break-even + ATR trailing for an open position. Uses the current price/ATR
+// already fetched for this symbol. Live: modifies the bracket stop order.
+async function managePosition(symbol, side, price, atrVal, openBySymbol) {
+  if (!cfg.manage_positions) return;
+  const meta = state.openTrades[symbol];
+  if (!meta) return;
+  const isLong = side === 'long';
+  const initDist = meta.initStopDist || Math.abs(meta.entry - meta.stop);
+  const profitR = initDist > 0 ? (isLong ? price - meta.entry : meta.entry - price) / initDist : 0;
+
+  let newStop = meta.stop;
+  if ((cfg.be_at_r ?? 0) > 0 && !meta.slAtBE && profitR >= cfg.be_at_r) { newStop = meta.entry; meta.slAtBE = true; }
+  if (cfg.trail_enabled && profitR > 0 && atrVal) {
+    const trail = isLong ? price - atrVal * (cfg.trail_atr_mult ?? 2) : price + atrVal * (cfg.trail_atr_mult ?? 2);
+    if (isLong ? trail > newStop : trail < newStop) newStop = trail;
+  }
+  const improved = isLong ? newStop > meta.stop : newStop < meta.stop;
+  if (!improved) return;
+
+  if (!cfg.dry_run) {
+    try {
+      const orders = (await trading.getOrders({})).orders;
+      const slOrder = orders.find(o => o.symbol === symbol && o.type === 'stop' && o.side === (isLong ? 'sell' : 'buy'));
+      if (slOrder) await trading.modifyOrder({ order_id: slOrder.id, stop_price: round2(newStop) });
+    } catch (e) { log(`  ~ manage ${symbol} modify failed: ${e.message}`); return; }
+  }
+  log(`  ~ manage ${symbol}: SL ${fmt(meta.stop)} -> ${fmt(newStop)} (R=${profitR.toFixed(2)}${meta.slAtBE ? ' BE' : ''})`);
+  meta.stop = newStop;
+  saveState();
+}
+
+// Shared entry logic used by BOTH the poll loop and the webhook. Enforces
+// halt, position caps, dedupe, and reverses on an opposite-side signal.
+async function openSignal({ symbol, side, entry, stop, target }, openBySymbol, equity, source) {
+  const sideNorm = (side === 'buy' || side === 'long') ? 'long' : 'short';
+  if (state.halted) { log(`  -> reject ${sideNorm} ${symbol}: halted (${state.haltReason}) [${source}]`); return { ok: false, reason: 'halted' }; }
+
+  const existing = openBySymbol[symbol];
+  if (existing === sideNorm) { log(`  -> skip ${sideNorm} ${symbol}: already ${existing} [${source}]`); return { ok: false, reason: 'already_open' }; }
+  if (existing && existing !== sideNorm) {
+    log(`  -> reverse ${symbol}: close ${existing} then open ${sideNorm} [${source}]`);
+    await closeSymbol(symbol, openBySymbol, 'reverse');
+  }
+  if (Object.keys(openBySymbol).length >= cfg.max_open_positions) {
+    log(`  -> skip ${sideNorm} ${symbol}: max ${cfg.max_open_positions} positions [${source}]`);
+    return { ok: false, reason: 'max_positions' };
+  }
+  const guard = entryGuards(symbol);
+  if (!guard.ok) { log(`  -> skip ${sideNorm} ${symbol}: ${guard.reason} [${source}]`); return { ok: false, reason: guard.reason }; }
+
+  const stopDist = Math.abs(entry - stop);
+  const qty = sizePosition(entry, stopDist, equity);
+  log(`  -> OPEN ${sideNorm} ${symbol} qty=${qty} entry~${fmt(entry)} SL=${fmt(stop)} TP=${fmt(target)} [${source}]${cfg.dry_run ? ' [dry-run]' : ''}`);
+  if (!cfg.dry_run) {
+    await trading.placeOrder({ symbol, side: sideNorm === 'long' ? 'buy' : 'sell', qty, take_profit: round2(target), stop_loss: round2(stop) });
+  }
+  state.openTrades[symbol] = { side: sideNorm, qty, entry, stop, target, source, openTime: Date.now(), initStopDist: stopDist, slAtBE: false };
+  openBySymbol[symbol] = sideNorm;
+  rollTradesDay();
+  state.tradesToday++;
+  saveState();
+  notify(`OPEN ${sideNorm} ${symbol} qty ${qty} @ ${fmt(entry)} | SL ${fmt(stop)} TP ${fmt(target)} [${source}]${cfg.dry_run ? ' (dry)' : ''}`);
+  return { ok: true, side: sideNorm, qty, entry, stop, target };
+}
+
+// Read FPU-MAX-V5's live composite bias / verdict / regime from its on-chart
+// panel (works for the currently-loaded chart symbol). Returns null if absent.
+async function readFpuBias() {
+  const t = await data.getPineTables({ study_filter: cfg.fpu_study_filter || 'MAX' });
+  const st = (t.studies || [])[0];
+  if (!st || !st.tables) return null;
+  let composite = null, verdict = null, regime = null;
+  for (const tbl of st.tables) {
+    for (const row of (tbl.rows || [])) {
+      const parts = String(row).split('|').map(s => s.trim());
+      const k = parts[0], v = parts[1];
+      if (/^COMPOSITE/i.test(k)) composite = parseFloat(v);
+      else if (/^VERDICT/i.test(k)) verdict = v;
+      else if (/^REGIME/i.test(k)) regime = v;
     }
+  }
+  if (composite == null) return null;
+  return { composite, verdict, regime };
+}
+
+function fpuToBias(fpu) {
+  if (!fpu) return 'neutral';
+  const regimeOk = !cfg.fpu_regime_filter || fpu.regime === 'TRENDING' || fpu.regime === 'MIXED';
+  if (!regimeOk) return 'neutral';
+  if (fpu.composite >= (cfg.fpu_bull ?? 65)) return 'long';
+  if (fpu.composite <= (cfg.fpu_bear ?? 35) && cfg.allow_short) return 'short';
+  return 'neutral';
+}
+
+// Combine the bot's own bias with FPU's bias. Rules:
+//   all_agree — trade only when both say the same direction (confluence)
+//   either    — trade if either fires and the other doesn't oppose
+function combineBias(internal, fpu, rule = 'all_agree') {
+  if (rule === 'either') {
+    if ((internal === 'long' || fpu === 'long') && internal !== 'short' && fpu !== 'short') return 'long';
+    if ((internal === 'short' || fpu === 'short') && internal !== 'long' && fpu !== 'long') return 'short';
+    return 'neutral';
+  }
+  // all_agree (default)
+  if (internal === fpu && (internal === 'long' || internal === 'short')) return internal;
+  return 'neutral';
+}
+
+async function evaluateSymbol(symbol, openBySymbol, equity) {
+  const usesFpu = cfg.signal_source === 'fpu' || cfg.signal_source === 'combined';
+  await chart.setSymbol({ symbol });
+  await new Promise(r => setTimeout(r, usesFpu ? 2500 : 1500));
+  const ohlcv = await data.getOhlcv({ count: 250 });
+  const a = analyze(ohlcv.bars); // price + ATR always; internal bias
+
+  // Bias source: internal indicators, FPU-MAX-V5 on the chart, or both combined.
+  let bias = a.bias;
+  let detail = `ema=${fmt(a.ema)} rsi=${fmt(a.rsi, 1)} trend=${a.trendUp ? 'up' : a.trendDown ? 'down' : 'flat'} vol=${a.volOk ? 'ok' : 'low'} bias=${bias}`;
+  if (usesFpu) {
+    const fpu = await readFpuBias();
+    const fpuBias = fpuToBias(fpu);
+    const fpuStr = fpu ? `fpu=${fpu.composite}%/${fpu.verdict}/${fpu.regime}->${fpuBias}` : 'fpu=unavailable->neutral';
+    if (cfg.signal_source === 'fpu') {
+      bias = fpuBias;
+      detail = fpuStr;
+    } else { // combined
+      bias = combineBias(a.bias, fpuBias, cfg.combine_rule || 'all_agree');
+      detail = `internal=${a.bias} ${fpuStr} [${cfg.combine_rule || 'all_agree'}]-> ${bias}`;
+    }
+  }
+
+  const existing = openBySymbol[symbol]; // 'long' | 'short' | undefined
+  log(`${symbol} px=${a.price} atr=${fmt(a.atr)} ${detail} pos=${existing || 'flat'}`);
+
+  // Manage an existing position (break-even / trailing) using this tick's price+ATR
+  if (existing) await managePosition(symbol, existing, a.price, a.atr, openBySymbol);
+
+  // Exit if bias flipped against an open position
+  if (existing && existing !== bias && bias !== 'neutral') {
+    log(`  -> close ${existing} ${symbol} (bias flip -> ${bias})`);
+    await closeSymbol(symbol, openBySymbol, 'bias_flip');
+  }
+
+  // Open a new position matching bias (ATR-based SL/TP either way)
+  if (!openBySymbol[symbol] && (bias === 'long' || bias === 'short')) {
     const stopDist = a.atr * cfg.atr_stop_mult;
-    const isLong = a.bias === 'long';
+    const isLong = bias === 'long';
     const stop = isLong ? a.price - stopDist : a.price + stopDist;
     const target = isLong ? a.price + stopDist * cfg.risk_reward : a.price - stopDist * cfg.risk_reward;
-    const qty = sizePosition(a.price, stopDist, equity);
-    log(`  -> OPEN ${a.bias} ${symbol} qty=${qty} entry~${fmt(a.price)} SL=${fmt(stop)} TP=${fmt(target)}${cfg.dry_run ? '  [dry-run]' : ''}`);
-    if (!cfg.dry_run) {
-      await trading.placeOrder({ symbol, side: isLong ? 'buy' : 'sell', qty, take_profit: round2(target), stop_loss: round2(stop) });
-    } else {
-      state.dryBook[symbol] = { side: a.bias, qty, entry: a.price, stop, target };
-    }
-    openBySymbol[symbol] = a.bias;
-    saveState();
+    await openSignal({ symbol, side: bias, entry: a.price, stop, target }, openBySymbol, equity, cfg.signal_source || 'poll');
   }
 }
 
@@ -250,13 +480,7 @@ async function tick() {
   rollDayIfNeeded(equity);
 
   // Build the map of currently-open positions
-  const openBySymbol = {};
-  if (!cfg.dry_run) {
-    try { const { positions } = await trading.getPositions(); for (const p of positions) openBySymbol[p.symbol] = p.side; }
-    catch (e) { log('WARN getPositions:', e.message); }
-  } else {
-    for (const [sym, p] of Object.entries(state.dryBook)) openBySymbol[sym] = p.side;
-  }
+  const openBySymbol = await currentOpenMap();
 
   for (const symbol of cfg.symbols) {
     try { await evaluateSymbol(symbol, openBySymbol, equity); }
@@ -264,7 +488,9 @@ async function tick() {
   }
 
   if (checkHalts(equity)) {
-    log(`HALT: reason=${state.haltReason} consecutiveLosses=${state.consecutiveLosses} equity=${equity != null ? equity.toFixed(2) : 'n/a'} dayStart=${state.dayStartEquity != null ? state.dayStartEquity.toFixed(2) : 'n/a'}`);
+    const m = `HALT: reason=${state.haltReason} consecutiveLosses=${state.consecutiveLosses} equity=${equity != null ? equity.toFixed(2) : 'n/a'} dayStart=${state.dayStartEquity != null ? state.dayStartEquity.toFixed(2) : 'n/a'} | ${statsSummary()}`;
+    log(m);
+    notify(m);
     saveState();
   }
 }
@@ -273,19 +499,128 @@ async function tick() {
 const fmt = (n, d = 2) => (n == null ? 'n/a' : Number(n).toFixed(d));
 const round2 = (n) => Math.round(n * 100) / 100;
 
+// Build the current open-position map (live positions or the dry-run book).
+async function currentOpenMap() {
+  const openBySymbol = {};
+  if (!cfg.dry_run) {
+    try { const { positions } = await trading.getPositions(); for (const p of positions) openBySymbol[p.symbol] = p.side; }
+    catch (e) { log('WARN getPositions:', e.message); }
+  } else {
+    for (const [sym, p] of Object.entries(state.openTrades)) openBySymbol[sym] = p.side;
+  }
+  return openBySymbol;
+}
+
+// ---- Webhook listener ----
+// Consumes the JSON alert emitted by FPU-MAX-V5 (or any alert with the same
+// shape): {symbol, tf, signal:"long"|"short"|"close", price, entry, sl, tp1, ...}
+let webhookServer = null;
+function startHttpServer() {
+  const port = cfg.webhook_port || 8080;
+  const host = cfg.webhook_host || '127.0.0.1';
+  const path = cfg.webhook_path || '/tv-webhook';
+  const statusPath = cfg.status_path || '/status';
+  const map = cfg.webhook_symbol_map || {};
+
+  webhookServer = createServer((req, res) => {
+    // Status endpoint (read-only snapshot)
+    if (req.method === 'GET' && cfg.status_enabled && req.url === statusPath) {
+      loadState();
+      const snapshot = {
+        dry_run: cfg.dry_run, signal_source: cfg.signal_source || 'internal',
+        halted: state.halted, haltReason: state.haltReason,
+        tradesToday: state.tradesToday, stats: state.stats,
+        open_positions: Object.keys(state.openTrades || {}).length,
+        openTrades: state.openTrades,
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(snapshot, null, 2));
+      return;
+    }
+    if (req.method !== 'POST' || req.url !== path || !cfg.webhook_enabled) {
+      res.writeHead(404); res.end('not found'); return;
+    }
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 1e6) req.destroy(); });
+    req.on('end', async () => {
+      let ok = false, msg = 'error';
+      try {
+        const p = JSON.parse(body);
+        // Optional shared secret: include "secret" in the alert JSON to use it.
+        if (cfg.webhook_secret && p.secret !== cfg.webhook_secret) {
+          log(`WEBHOOK rejected: bad/missing secret from ${req.socket.remoteAddress}`);
+          res.writeHead(401); res.end('unauthorized'); return;
+        }
+        const rawSym = String(p.symbol || '').trim();
+        const symbol = map[rawSym] || rawSym; // map "BTCUSD" -> "BITSTAMP:BTCUSD" etc
+        const sig = String(p.signal || '').toLowerCase();
+        if (!symbol || !['long', 'short', 'buy', 'sell', 'close'].includes(sig)) {
+          res.writeHead(400); res.end('bad payload'); return;
+        }
+        log(`WEBHOOK ${sig} ${symbol} price=${p.price ?? '?'} composite=${p.composite ?? '?'} regime=${p.regime ?? '?'}`);
+
+        loadState();
+        if (state.halted) { res.writeHead(200); res.end('halted'); return; }
+        await ensureConnected();
+        const equity = await currentEquity();
+        rollDayIfNeeded(equity);
+        const openBySymbol = await currentOpenMap();
+
+        if (sig === 'close') {
+          await closeSymbol(symbol, openBySymbol);
+          ok = true; msg = 'closed';
+        } else {
+          const isLong = sig === 'long' || sig === 'buy';
+          const entry = Number(p.entry ?? p.price);
+          // Use alert-provided SL/TP; fall back to ATR-style defaults from entry if absent.
+          const fallbackDist = entry * 0.01;
+          const stop = Number(p.sl ?? (isLong ? entry - fallbackDist : entry + fallbackDist));
+          const target = Number(p.tp1 ?? (isLong ? entry + fallbackDist * cfg.risk_reward : entry - fallbackDist * cfg.risk_reward));
+          if (!(entry > 0)) { res.writeHead(400); res.end('no entry price'); return; }
+          const r = await openSignal({ symbol, side: isLong ? 'long' : 'short', entry, stop, target }, openBySymbol, equity, 'webhook');
+          ok = r.ok; msg = r.ok ? 'opened' : r.reason;
+        }
+        checkHalts(equity);
+      } catch (err) {
+        log(`WEBHOOK error: ${err.message}`);
+        res.writeHead(400); res.end('error: ' + err.message); return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, result: msg }));
+    });
+  });
+
+  webhookServer.on('error', (e) => log(`HTTP server error: ${e.message}`));
+  webhookServer.listen(port, host, () => {
+    const routes = [cfg.webhook_enabled ? `POST ${path}` : null, cfg.status_enabled ? `GET ${statusPath}` : null].filter(Boolean).join(', ');
+    log(`HTTP server on http://${host}:${port} (${routes})  (dry_run=${cfg.dry_run})`);
+    if (cfg.webhook_enabled && host === '127.0.0.1') log('  note: TradingView is cloud-hosted — expose this via a tunnel (e.g. ngrok) for live TV alerts, or POST locally to test.');
+  });
+}
+
 // ---- Main loop ----
 let timer = null;
 async function main() {
   loadState();
-  log(`Bot v2 starting | dry_run=${cfg.dry_run} symbols=${cfg.symbols.join(',')} tf=${cfg.timeframe} poll=${cfg.poll_seconds}s risk=${cfg.risk_per_trade_pct}% atrStop=${cfg.atr_stop_mult}x rr=${cfg.risk_reward}`);
-  if (cfg.timeframe) { try { await chart.setTimeframe({ timeframe: cfg.timeframe }); } catch {} }
-  await tick();
-  timer = setInterval(() => { tick().catch(err => log('tick error:', err.message)); }, Math.max(cfg.poll_seconds, 10) * 1000);
+  const pollOn = cfg.poll_enabled !== false;
+  log(`Bot v2 starting | dry_run=${cfg.dry_run} poll=${pollOn ? cfg.poll_seconds + 's' : 'off'} webhook=${cfg.webhook_enabled ? 'on' : 'off'} symbols=${cfg.symbols.join(',')} tf=${cfg.timeframe} risk=${cfg.risk_per_trade_pct}% atrStop=${cfg.atr_stop_mult}x rr=${cfg.risk_reward}`);
+
+  if (cfg.webhook_enabled || cfg.status_enabled) startHttpServer();
+
+  if (pollOn) {
+    if (cfg.timeframe) { try { await chart.setTimeframe({ timeframe: cfg.timeframe }); } catch {} }
+    await tick();
+    timer = setInterval(() => { tick().catch(err => log('tick error:', err.message)); }, Math.max(cfg.poll_seconds, 10) * 1000);
+  } else if (!cfg.webhook_enabled) {
+    log('Nothing to do: poll_enabled and webhook_enabled are both off. Exiting.');
+    process.exit(0);
+  }
 }
 
 async function shutdown() {
   log('Shutting down');
   if (timer) clearInterval(timer);
+  if (webhookServer) webhookServer.close();
   saveState();
   await disconnect().catch(() => {});
   process.exit(0);

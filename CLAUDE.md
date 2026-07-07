@@ -83,6 +83,12 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 Related non-MCP tooling in `scripts/`:
 - `rules_strategy.pine` → the rules.json bias (EMA20 + RSI) as a backtestable Pine strategy, with ATR-based stops/targets, risk-% position sizing, and optional trend + volume filters that mirror bot.js.
 - `bot.js` → standalone loop that reads OHLCV, computes EMA/RSI/ATR/trend/volume, applies the rules, and places paper trades with broker-managed SL/TP. Risk sizing from `risk_per_trade_pct`, halts on loss-streak and daily-loss limits, persists state across restarts (`bot.state.json`) and logs to `bot.log`. Copy `bot.config.example.json` → `bot.config.json`. Defaults to `dry_run: true`; run with `--live` to place paper orders.
+  - `signal_source` selects the bias source: `"internal"` (bot's own EMA/RSI/ATR/trend/volume), `"fpu"` (reads FPU-MAX-V5's composite %/verdict/regime live from the on-chart panel via `data_get_pine_tables`, then longs when composite ≥ `fpu_bull` / shorts when ≤ `fpu_bear`, gated by regime), or `"combined"` (uses BOTH — merges internal + FPU per `combine_rule`: `all_agree` for confluence, or `either`). `fpu`/`combined` need FPU-MAX-V5 on the chart. Either way the bot handles ATR SL/TP and risk-% sizing.
+  - Also has an optional **webhook listener** (`webhook_enabled`) that consumes the FPU-MAX-V5 JSON alert (`{symbol, signal, entry, sl, tp1, ...}`) over HTTP and opens/reverses/closes paper positions through the same risk checks. `webhook_symbol_map` maps alert tickers to broker symbols; optional `webhook_secret` (a `secret` field in the alert JSON). TradingView is cloud-hosted, so expose the port via a tunnel (ngrok) for live TV alerts. Set `poll_enabled: false` for pure webhook mode.
+  - **Active management** (`manage_positions`): moves SL to break-even after `be_at_r` and ATR-trails (`trail_enabled`) — live via `trade_modify` on the bracket stop order.
+  - **Trade journal**: every close appends to `bot.trades.csv` (entry/exit/pnl/R/source/reason) and updates win%/pnl/avgR stats.
+  - **Discipline guards**: `session_filter` (timezone window + skip first N min), per-symbol `cooldown_seconds` after a stop-out, `max_trades_per_day`.
+  - **Notifications + status**: Telegram/Discord alerts on open/close/halt (`notify`), and `GET /status` (`status_enabled`) returns a live JSON snapshot (positions, stats, halt state) on the same HTTP server.
 
 ### "Manage alerts"
 - `alert_create` → set price alert (condition: "crossing", "greater_than", "less_than")

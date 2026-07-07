@@ -26,8 +26,44 @@
   "stop_after_consecutive_losses": 2,
   "max_daily_loss_pct": 3.0,
 
+  "manage_positions": true,
+  "be_at_r": 1.0,
+  "trail_enabled": false,
+  "trail_atr_mult": 2.0,
+
+  "session_filter": { "enabled": false, "timezone": "America/New_York", "start": "09:30", "end": "16:00", "skip_open_minutes": 15 },
+  "cooldown_seconds": 900,
+  "max_trades_per_day": 10,
+
+  "status_enabled": true,
+  "status_path": "/status",
+  "notify": {
+    "telegram": { "enabled": false, "bot_token": "", "chat_id": "" },
+    "discord": { "enabled": false, "webhook_url": "" }
+  },
+  "journal_file": "scripts/bot.trades.csv",
+
   "allow_short": true,
   "dry_run": true,
+
+  "signal_source": "internal",
+  "combine_rule": "all_agree",
+  "fpu_study_filter": "MAX",
+  "fpu_bull": 65,
+  "fpu_bear": 35,
+  "fpu_regime_filter": true,
+
+  "poll_enabled": true,
+  "webhook_enabled": false,
+  "webhook_host": "127.0.0.1",
+  "webhook_port": 8080,
+  "webhook_path": "/tv-webhook",
+  "webhook_secret": "",
+  "webhook_symbol_map": {
+    "BTCUSD": "BITSTAMP:BTCUSD",
+    "ETHUSD": "COINBASE:ETHUSD",
+    "SOLUSD": "COINBASE:SOLUSD"
+  },
 
   "state_file": "scripts/bot.state.json",
   "log_file": "scripts/bot.log"
