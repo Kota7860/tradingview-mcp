@@ -229,8 +229,65 @@ function analyze(bars) {
   return { bias, price, ema: e, rsi: r, atr: a, trendEma, trendUp, trendDown, vol, volMa, volOk };
 }
 
+// ---- FX conversion (for forex_mode currency-correct sizing) ----
+// fxRates[currency] = USD value of 1 unit of that currency.
+let fxRates = { USD: 1 };
+function baseQuote(symbol) {
+  const p = String(symbol).includes(':') ? symbol.split(':')[1] : symbol;
+  return { base: p.slice(0, 3).toUpperCase(), quote: p.slice(3, 6).toUpperCase() };
+}
+async function loadFxRates() {
+  const acct = (cfg.account_currency || 'USD').toUpperCase();
+  fxRates = { [acct]: 1 };
+  const map = cfg.fx_rate_symbols || {};
+  const entries = Object.entries(map);
+  if (entries.length === 0) return;
+  let original = null;
+  try { original = await evalCurrentSymbol(); } catch {}
+  for (const [ccy, sym] of entries) {
+    try {
+      await chart.setSymbol({ symbol: sym });
+      await new Promise(r => setTimeout(r, 400));
+      const q = await data.getQuote({});
+      const last = q.last ?? q.close;
+      if (!(last > 0)) continue;
+      const { base, quote } = baseQuote(sym);
+      if (base === acct) fxRates[ccy] = 1 / last;      // USDJPY -> 1 JPY = 1/USDJPY USD
+      else if (quote === acct) fxRates[ccy] = last;    // GBPUSD -> 1 GBP = GBPUSD USD
+    } catch (e) { log(`WARN fx ${sym}: ${e.message}`); }
+  }
+  if (original) { try { await chart.setSymbol({ symbol: original }); } catch {} }
+  log(`FX rates loaded: ${Object.entries(fxRates).map(([k, v]) => `${k}=${v.toFixed(5)}`).join(' ')}`);
+}
+async function evalCurrentSymbol() {
+  const { evaluate, KNOWN_PATHS } = await import('../src/connection.js');
+  return evaluate(`${KNOWN_PATHS.chartApi}.symbol()`);
+}
+// USD (account-currency) value of a 1-unit price move in `symbol`'s quote currency.
+function quoteToAcct(symbol) {
+  const { quote } = baseQuote(symbol);
+  return fxRates[quote] ?? null;
+}
+// Returns a currency code if opening `symbol` would exceed max_positions_per_currency
+// (a pair touches both its base and quote currency), else null.
+function currencyExposureBlocked(symbol, openBySymbol) {
+  const cap = cfg.max_positions_per_currency;
+  if (!cfg.forex_mode || !cap || cap <= 0) return null;
+  const counts = {};
+  for (const sym of Object.keys(openBySymbol)) {
+    const { base, quote } = baseQuote(sym);
+    counts[base] = (counts[base] || 0) + 1;
+    counts[quote] = (counts[quote] || 0) + 1;
+  }
+  const { base, quote } = baseQuote(symbol);
+  if ((counts[base] || 0) >= cap) return base;
+  if ((counts[quote] || 0) >= cap) return quote;
+  return null;
+}
+
 // ---- Position sizing ----
-function sizePosition(price, stopDistance, equity) {
+function sizePosition(price, stopDistance, equity, symbol) {
+  if (cfg.forex_mode) return sizeForex(stopDistance, equity, symbol);
   let qty = cfg.qty_per_trade;
   if (cfg.risk_per_trade_pct > 0 && equity && stopDistance > 0) {
     const riskAmount = equity * (cfg.risk_per_trade_pct / 100);
@@ -238,8 +295,21 @@ function sizePosition(price, stopDistance, equity) {
   }
   qty = Math.min(qty, cfg.max_qty || qty);
   qty = Math.max(qty, cfg.min_qty || 0);
-  // round to a sane precision
   return Math.round(qty * 1e6) / 1e6;
+}
+// Currency-correct forex sizing: risk the same account-currency amount on every
+// pair regardless of quote currency. Returns whole units rounded to lot step.
+function sizeForex(stopDistance, equity, symbol) {
+  const riskAmount = (equity || 0) * (cfg.risk_per_trade_pct / 100);
+  let q2a = quoteToAcct(symbol);
+  if (q2a == null) { log(`  ~ no FX rate for ${symbol} quote; assuming account-currency quote`); q2a = 1; }
+  const stopInAcct = stopDistance * q2a; // account-currency loss per unit at the stop
+  let units = (riskAmount > 0 && stopInAcct > 0) ? riskAmount / stopInAcct : (cfg.fx_min_units || 1000);
+  const step = cfg.fx_lot_step || 1000;
+  units = Math.round(units / step) * step;
+  units = Math.min(units, cfg.fx_max_units || units);
+  units = Math.max(units, cfg.fx_min_units || step);
+  return units;
 }
 
 // ---- Day / halt bookkeeping ----
@@ -367,9 +437,11 @@ async function openSignal({ symbol, side, entry, stop, target }, openBySymbol, e
   }
   const guard = entryGuards(symbol);
   if (!guard.ok) { log(`  -> skip ${sideNorm} ${symbol}: ${guard.reason} [${source}]`); return { ok: false, reason: guard.reason }; }
+  const expo = currencyExposureBlocked(symbol, openBySymbol);
+  if (expo) { log(`  -> skip ${sideNorm} ${symbol}: currency exposure cap on ${expo} [${source}]`); return { ok: false, reason: 'currency_exposure' }; }
 
   const stopDist = Math.abs(entry - stop);
-  const qty = sizePosition(entry, stopDist, equity);
+  const qty = sizePosition(entry, stopDist, equity, symbol);
   log(`  -> OPEN ${sideNorm} ${symbol} qty=${qty} entry~${fmt(entry)} SL=${fmt(stop)} TP=${fmt(target)} [${source}]${cfg.dry_run ? ' [dry-run]' : ''}`);
   if (!cfg.dry_run) {
     await trading.placeOrder({ symbol, side: sideNorm === 'long' ? 'buy' : 'sell', qty, take_profit: round2(target), stop_loss: round2(stop) });
@@ -511,6 +583,21 @@ async function currentOpenMap() {
   return openBySymbol;
 }
 
+// Resolve a TradingView ticker to a broker symbol: explicit map wins, else add
+// the default exchange prefix if none present (e.g. "EURUSD" -> "OANDA:EURUSD").
+function resolveSymbol(rawSym, map) {
+  if (map && map[rawSym]) return map[rawSym];
+  if (rawSym.includes(':')) return rawSym;
+  if (cfg.default_exchange) return `${cfg.default_exchange}:${rawSym}`;
+  return rawSym;
+}
+function isBlocked(rawSym, resolved) {
+  const bl = cfg.blocklist || [];
+  if (bl.length === 0) return false;
+  const plain = resolved.includes(':') ? resolved.split(':')[1] : resolved;
+  return bl.some(b => b === rawSym || b === resolved || b === plain);
+}
+
 // ---- Webhook listener ----
 // Consumes the JSON alert emitted by FPU-MAX-V5 (or any alert with the same
 // shape): {symbol, tf, signal:"long"|"short"|"close", price, entry, sl, tp1, ...}
@@ -552,10 +639,14 @@ function startHttpServer() {
           res.writeHead(401); res.end('unauthorized'); return;
         }
         const rawSym = String(p.symbol || '').trim();
-        const symbol = map[rawSym] || rawSym; // map "BTCUSD" -> "BITSTAMP:BTCUSD" etc
+        const symbol = resolveSymbol(rawSym, map); // "EURUSD" -> "OANDA:EURUSD", or explicit map
         const sig = String(p.signal || '').toLowerCase();
         if (!symbol || !['long', 'short', 'buy', 'sell', 'close'].includes(sig)) {
           res.writeHead(400); res.end('bad payload'); return;
+        }
+        if (sig !== 'close' && isBlocked(rawSym, symbol)) {
+          log(`WEBHOOK skip ${sig} ${symbol}: blocklisted`);
+          res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ ok: false, result: 'blocklisted' })); return;
         }
         log(`WEBHOOK ${sig} ${symbol} price=${p.price ?? '?'} composite=${p.composite ?? '?'} regime=${p.regime ?? '?'}`);
 
@@ -604,6 +695,16 @@ async function main() {
   loadState();
   const pollOn = cfg.poll_enabled !== false;
   log(`Bot v2 starting | dry_run=${cfg.dry_run} poll=${pollOn ? cfg.poll_seconds + 's' : 'off'} webhook=${cfg.webhook_enabled ? 'on' : 'off'} symbols=${cfg.symbols.join(',')} tf=${cfg.timeframe} risk=${cfg.risk_per_trade_pct}% atrStop=${cfg.atr_stop_mult}x rr=${cfg.risk_reward}`);
+
+  if (cfg.forex_mode) {
+    // Load FX conversion rates in the BACKGROUND (each chart switch is ~12s, so
+    // ~80s for all pairs). Until they arrive, forex sizing falls back to
+    // assuming a USD-quoted pair (exact for majors, approximate for crosses).
+    log('Loading FX conversion rates in background (sizing exact once loaded)...');
+    loadFxRates().catch(e => log('FX load error:', e.message));
+    const refreshMs = Math.max(cfg.fx_rate_refresh_min || 30, 5) * 60 * 1000;
+    setInterval(() => { loadFxRates().catch(e => log('FX refresh error:', e.message)); }, refreshMs);
+  }
 
   if (cfg.webhook_enabled || cfg.status_enabled) startHttpServer();
 
