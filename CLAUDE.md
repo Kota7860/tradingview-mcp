@@ -89,6 +89,7 @@ Related non-MCP tooling in `scripts/`:
   - **Trade journal**: every close appends to `bot.trades.csv` (entry/exit/pnl/R/source/reason) and updates win%/pnl/avgR stats.
   - **Discipline guards**: `session_filter` (timezone window + skip first N min), per-symbol `cooldown_seconds` after a stop-out, `max_trades_per_day`.
   - **Notifications + status**: Telegram/Discord alerts on open/close/halt (`notify`), and `GET /status` (`status_enabled`) returns a live JSON snapshot (positions, stats, halt state) on the same HTTP server.
+  - **Forex mode** (`forex_mode`, for scaling the webhook to all FX pairs): currency-correct position sizing — risks the same account-currency amount on every pair by converting the quote currency to USD via FX rates loaded in the background (`fx_rate_symbols`; each chart switch is ~12s so they load async and sizing falls back to USD-quote until ready). Also: TV-ticker→broker-symbol normalization (`default_exchange` prefix, e.g. `EURUSD`→`OANDA:EURUSD`), per-currency exposure caps (`max_positions_per_currency`), and an exotic `blocklist`. Feed it via TradingView alerts on a watchlist/screener (Path A) rather than the chart-scanning poll loop.
 
 ### "Manage alerts"
 - `alert_create` → set price alert (condition: "crossing", "greater_than", "less_than")

@@ -22,6 +22,20 @@
   "max_qty": 0.05,
   "min_qty": 0.0001,
 
+  "forex_mode": false,
+  "account_currency": "USD",
+  "default_exchange": "OANDA",
+  "fx_min_units": 1000,
+  "fx_max_units": 100000,
+  "fx_lot_step": 1000,
+  "fx_rate_refresh_min": 30,
+  "fx_rate_symbols": {
+    "JPY": "OANDA:USDJPY", "CHF": "OANDA:USDCHF", "CAD": "OANDA:USDCAD",
+    "GBP": "OANDA:GBPUSD", "EUR": "OANDA:EURUSD", "AUD": "OANDA:AUDUSD", "NZD": "OANDA:NZDUSD"
+  },
+  "max_positions_per_currency": 3,
+  "blocklist": ["USDTRY", "USDZAR", "USDMXN", "USDHUF", "USDRUB"],
+
   "max_open_positions": 2,
   "stop_after_consecutive_losses": 2,
   "max_daily_loss_pct": 3.0,
